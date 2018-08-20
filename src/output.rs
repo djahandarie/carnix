@@ -1,7 +1,7 @@
 use std::path::Path;
 use toml;
 use std;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use regex::Regex;
 use std::path::PathBuf;
@@ -27,7 +27,7 @@ impl<'a> std::fmt::Display for FeatName<'a> {
 }
 
 #[derive(Debug)]
-enum CrateType {
+pub enum CrateType {
     Workspace(BTreeMap<String, (Crate, PathBuf)>),
     Single(String, (Crate, PathBuf)),
 }
@@ -62,7 +62,7 @@ impl CrateType {
             CrateType::Single(_, _) => None,
         }
     }
-    fn source_type<P: AsRef<Path>>(&self, src: Option<P>, name: &str) -> SourceType {
+    pub fn source_type<P: AsRef<Path>>(&self, src: Option<P>, name: &str) -> SourceType {
         if let Some(&(_, ref path)) = self.get(name) {
             if let Some(ref src) = src {
                 if self.is_workspace() {
@@ -91,7 +91,7 @@ impl CrateType {
     }
 }
 
-fn workspace_members(base_path: &Path, cargo_toml: &toml::Value) -> Option<CrateType> {
+pub fn workspace_members(base_path: &Path, cargo_toml: &toml::Value) -> Option<CrateType> {
     if let Some(ws) = cargo_toml.get("workspace") {
         let mut workspace_members = BTreeMap::new();
         let members = ws.as_table()
@@ -481,7 +481,7 @@ fn output<W: Write>(
     if standalone {
         nix_file.write_all(b"with import <nixpkgs> {};\n")?;
     } else {
-        nix_file.write_all(b"{ lib, buildPlatform, buildRustCrate, buildRustCrateHelpers, cratesIO, fetchgit }:\n")?;
+        nix_file.write_all(b"{ lib, buildPlatform, buildRustCrate, buildRustCrateHelpers, fetchgit }:\n")?;
     }
     nix_file.write_all(b"with buildRustCrateHelpers;\nlet inherit (lib.lists) fold;\n    inherit (lib.attrsets) recursiveUpdate;\nin\n")?;
     let mut names = BTreeSet::new();
@@ -489,38 +489,15 @@ fn output<W: Write>(
         names.insert(cra.name.clone());
     }
 
-    {
-        let mut extra_crates_io = std::io::BufWriter::new(std::fs::File::create("crates-io.nix")?);
-        extra_crates_io.write_all(b"{ lib, buildRustCrate, buildRustCrateHelpers }:
-with buildRustCrateHelpers;
-let inherit (lib.lists) fold;
-    inherit (lib.attrsets) recursiveUpdate;
-in
-rec {\n
-")?;
-        for (cra, meta) in all_packages.iter() {
-            if let Src::Crate { .. } = meta.src {
-                cra.output_package(root_prefix, &mut extra_crates_io, 2, &meta, &names, "")?;
-            }
-        }
-        extra_crates_io.write_all(b"}\n")?;
-    }
-    if standalone {
-        nix_file.write_all(b"let cratesIO = callPackage ./crates-io.nix { };
-    crates = cratesIO")?;
-    } else {
-        nix_file.write_all(b"let crates = cratesIO")?;
-    }
+    nix_file.write_all(b"let crates = {}")?;
+
     let mut is_first = true;
     for (cra, meta) in all_packages.iter() {
-        if let Src::Crate { .. } = meta.src {
-        } else {
-            if is_first {
-                writeln!(nix_file, " // rec {{")?;
-                is_first = false;
-            }
-            cra.output_package(root_prefix, &mut nix_file, 2, &meta, &names, "cratesIO.")?;
+        if is_first {
+            writeln!(nix_file, " // rec {{")?;
+            is_first = false;
         }
+        cra.output_package(root_prefix, &mut nix_file, 2, &meta, &names, "")?;
     }
     if is_first {
         nix_file.write_all(b"; in\n")?;
@@ -679,7 +656,7 @@ impl Crate {
             self.minor,
             self.patch,
             if self.subpatch.is_empty() { "" } else { "-" },
-            nix_name(&self.subpatch)
+            self.subpatch
         );
         // debug!("output_package_call {:?}", full_name);
         let nix_name_ = nix_name(&self.name);
@@ -689,30 +666,36 @@ impl Crate {
                nix_name_,
                version)?;
         let mut is_first = true;
+        let mut seen = HashSet::new();
         for deps in std::iter::once(&meta.dependencies)
             .chain(std::iter::once(&meta.build_dependencies))
             .chain(meta.target_dependencies.iter().map(|&(_, ref y)| y))
         {
             for (_, dep) in deps.iter().filter(|&(_, dep)| dep.cr.found_in_lock) {
+                let nn = nix_name(&dep.cr.name);
+                if seen.contains(&nn) {
+                    continue;
+                }
                 debug!("outputting dep = {:?}", dep);
                 if is_first {
                     writeln!(w, "")?;
                 }
                 is_first = false;
-                if self.subpatch.len() > 0 {
+                if dep.cr.subpatch.len() > 0 {
                     writeln!(w,"{}  {} = \"{}.{}.{}-{}\";",
                              indent,
-                             nix_name(&dep.cr.name),
+                             nn,
                              dep.cr.major, dep.cr.minor, dep.cr.patch,
                              dep.cr.subpatch
                     )?
                 } else {
                     writeln!(w,"{}  {} = \"{}.{}.{}\";",
                              indent,
-                             nix_name(&dep.cr.name),
+                             nn,
                              dep.cr.major, dep.cr.minor, dep.cr.patch,
                     )?
                 };
+                seen.insert(nn);
             }
         }
         if !is_first {
@@ -809,7 +792,7 @@ impl Crate {
                                 dep.cr.minor,
                                 dep.cr.patch,
                                 if dep.cr.subpatch.is_empty() { "" } else { "-" },
-                                nix_name(&dep.cr.subpatch),
+                                dep.cr.subpatch,
                                 FeatName(&feat.dep_feature),
                             );
                             let mut e = output_features.entry(dep_name).or_insert(Vec::new());
@@ -995,7 +978,7 @@ impl Crate {
                 };
                 let workspace_member =
                     workspace_member.as_ref().map(|x| {
-                        if let Ok(ws) = x.strip_prefix(root_prefix) {
+                        if let Ok(ws) = x.strip_prefix(path) {
                             ws
                         } else {
                             &x

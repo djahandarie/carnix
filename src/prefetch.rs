@@ -13,13 +13,16 @@ use std::borrow::Cow;
 use {Error, ErrorKind};
 use cache::*;
 use krate::*;
+use output::*;
 
 impl Crate {
-
     pub fn prefetch(&self, cache: &mut Cache, source_type: &SourceType) -> Result<Meta, Error> {
         let mut cargo_toml_path = PathBuf::new();
         let prefetch = match *source_type {
-            SourceType::Path { ref path, ref workspace_member } => {
+            SourceType::Path {
+                ref path,
+                ref workspace_member,
+            } => {
                 debug!("path: {:?}", path);
                 cargo_toml_path.push(path);
                 if let Some(ref mem) = *workspace_member {
@@ -30,20 +33,20 @@ impl Crate {
                     prefetch: Src::Path {
                         path: path.to_path_buf(),
                         workspace_member: workspace_member.as_ref().map(|x| x.to_path_buf()),
-                    }
+                    },
                 }
             }
             SourceType::CratesIO => {
                 let prefetch = self.prefetch_path(cache)?;
                 cargo_toml_path.push(&prefetch.path);
                 prefetch
-            },
+            }
             SourceType::Git { ref url, ref rev } => {
                 let prefetch = self.prefetch_git(url, rev, cache)?;
                 cargo_toml_path.push(&prefetch.path);
                 prefetch
-            },
-            _ => panic!("unsupported source")
+            }
+            _ => panic!("unsupported source"),
         };
 
         debug!("src = {:?}", prefetch.prefetch);
@@ -53,18 +56,36 @@ impl Crate {
         let mut f = std::fs::File::open(&cargo_toml_path)?;
         let mut toml = String::new();
         f.read_to_string(&mut toml).unwrap();
-        let mut v:toml::Value = match toml::de::from_str(&toml) {
+        let mut v: toml::Value = match toml::de::from_str(&toml) {
             Ok(v) => v,
             Err(e) => {
                 error!("{:?}: {:?}", cargo_toml_path, e);
-                return Err(e.into())
+                return Err(e.into());
             }
         };
+
+        let workspace_members = workspace_members(&prefetch.path, &v).expect(
+            "neither workspace nor regular crate",
+        );
+        let workspace_source_type = workspace_members.source_type(Some(&prefetch.path), &self.name);
+
+        if let SourceType::Path {
+            path: _,
+            workspace_member: Some(_),
+        } = workspace_source_type
+        {
+            // when our target crate is a workspace member of the current source, recurse into its source path
+            return self.prefetch(cache, &workspace_source_type);
+        }
+
         let v = v.as_table_mut().expect("v not a table");
 
         let (dependencies, implied, build_dependencies, target_dependencies) = {
             let prefetch_path = match &prefetch.prefetch {
-                &Src::Path { ref path, ref workspace_member } => {
+                &Src::Path {
+                    ref path,
+                    ref workspace_member,
+                } => {
                     if let Some(ref ws) = *workspace_member {
                         let mut p = path.to_path_buf();
                         p.push(ws);
@@ -72,11 +93,13 @@ impl Crate {
                     } else {
                         Cow::Borrowed(path)
                     }
-                },
-                _ => Cow::Borrowed(&prefetch.path)
+                }
+                _ => Cow::Borrowed(&prefetch.path),
             };
-            let (dependencies, implied) = make_dependencies(&prefetch_path, v.get("dependencies"), v.get("features"));
-            let (build_dependencies, _) = make_dependencies(&prefetch_path, v.get("build-dependencies"), None);
+            let (dependencies, implied) =
+                make_dependencies(&prefetch_path, v.get("dependencies"), v.get("features"));
+            let (build_dependencies, _) =
+                make_dependencies(&prefetch_path, v.get("build-dependencies"), None);
             debug!("dependencies of {:?} = {:?}", self.name, dependencies);
 
             let mut target_dependencies = Vec::new();
@@ -89,12 +112,18 @@ impl Crate {
                 debug!("target = {:?}", target);
                 for (a, b) in target {
                     debug!("a = {:?}", a);
-                    let (dependencies, _) = make_dependencies(&prefetch_path, b.get("dependencies"), None);
+                    let (dependencies, _) =
+                        make_dependencies(&prefetch_path, b.get("dependencies"), None);
                     target_dependencies.push((a, dependencies))
                 }
                 debug!("target_deps {:?}", target_dependencies);
             }
-            (dependencies, implied, build_dependencies, target_dependencies)
+            (
+                dependencies,
+                implied,
+                build_dependencies,
+                target_dependencies,
+            )
         };
         // Grab the authors from Cargo.toml, so we can create the
         // CARGO_PKG_AUTHORS environment variable at build time.
@@ -137,26 +166,44 @@ impl Crate {
     fn prefetch_path(&self, cache: &mut Cache) -> Result<Prefetch, std::io::Error> {
 
         let version = if self.subpatch.len() > 0 {
-            format!("{}.{}.{}-{}", self.major, self.minor, self.patch, self.subpatch)
+            format!(
+                "{}.{}.{}-{}",
+                self.major,
+                self.minor,
+                self.patch,
+                self.subpatch
+            )
         } else {
             format!("{}.{}.{}", self.major, self.minor, self.patch)
         };
-        let url = format!("https://crates.io/api/v1/crates/{}/{}/download", self.name, version);
+        let url = format!(
+            "https://crates.io/api/v1/crates/{}/{}/download",
+            self.name,
+            version
+        );
 
         let from_cache = cache.get(&url);
         if let Some(ref prefetch) = from_cache {
             if std::fs::metadata(&prefetch.path).is_ok() {
-                return Ok(prefetch.clone())
+                return Ok(prefetch.clone());
             }
         }
 
         println!("Prefetching {}-{}", self.name, version);
         debug!("url = {:?}", url);
         let prefetch = Command::new("nix-prefetch-url")
-            .args(&[ &url, "--unpack", "--name", &(self.name.clone() + "-" + &version) ][..])
+            .args(
+                &[
+                    &url,
+                    "--unpack",
+                    "--name",
+                    &(self.name.clone() + "-" + &version),
+                ]
+                    [..],
+            )
             .output()?;
 
-        let sha256:String = from_utf8(&prefetch.stdout).unwrap().trim().to_string();
+        let sha256: String = from_utf8(&prefetch.stdout).unwrap().trim().to_string();
         let path = get_path(&prefetch.stderr);
         let pre = Prefetch {
             prefetch: Src::Crate { sha256 },
@@ -176,14 +223,14 @@ impl Crate {
         let from_cache = cache.get(&cached_url);
         if let Some(ref prefetch) = from_cache {
             if std::fs::metadata(&prefetch.path).is_ok() {
-                return Ok(prefetch.clone())
+                return Ok(prefetch.clone());
             }
         }
 
         println!("Prefetching {} ({})", self.name, cached_url);
         debug!("cached_url = {:?}", cached_url);
         let prefetch = Command::new("nix-prefetch-git")
-            .args(&[ "--url", url, "--rev", rev ])
+            .args(&["--url", url, "--rev", rev])
             .output();
 
         match prefetch {
@@ -192,28 +239,31 @@ impl Crate {
                 Err(e.into())
             }
             Ok(prefetch) => {
-
                 if prefetch.status.success() {
 
-                    let prefetch_json: GitFetch = serde_json::from_str(from_utf8(&prefetch.stdout).unwrap()).unwrap();
+                    let prefetch_json: GitFetch =
+                        serde_json::from_str(from_utf8(&prefetch.stdout).unwrap()).unwrap();
                     let path = get_path(&prefetch.stderr);
 
                     let pre = Prefetch {
                         prefetch: Src::Git(prefetch_json),
-                        path: Path::new(path).to_path_buf()
+                        path: Path::new(path).to_path_buf(),
                     };
                     if from_cache.is_none() {
                         cache.insert(&cached_url, &pre);
                     }
                     Ok(pre)
                 } else {
-                    error!("nix-prefetch-git exited with error code {:?}: {:?}", prefetch.status, prefetch.stderr);
+                    error!(
+                        "nix-prefetch-git exited with error code {:?}: {:?}",
+                        prefetch.status,
+                        prefetch.stderr
+                    );
                     Err(ErrorKind::NixPrefetchGitFailed.into())
                 }
             }
         }
     }
-
 }
 
 fn include(v: &BTreeMap<String, toml::Value>) -> Option<Vec<String>> {
@@ -221,7 +271,11 @@ fn include(v: &BTreeMap<String, toml::Value>) -> Option<Vec<String>> {
         if let Some(inc) = inc.as_table() {
             if let Some(inc) = inc.get("include") {
                 if let Some(inc) = inc.as_array() {
-                    return Some(inc.into_iter().filter_map(|x| x.as_str().map(|x| x.to_string())).collect())
+                    return Some(
+                        inc.into_iter()
+                            .filter_map(|x| x.as_str().map(|x| x.to_string()))
+                            .collect(),
+                    );
                 }
             }
         }
@@ -246,7 +300,7 @@ fn crate_type(v: &BTreeMap<String, toml::Value>) -> Option<String> {
     if let Some(crate_file) = v.get("lib") {
         if let Some(crate_file) = crate_file.as_table() {
             if let Some(crate_type) = crate_file.get("crate-type") {
-                return Some(crate_type.as_str().unwrap().to_string())
+                return Some(crate_type.as_str().unwrap().to_string());
             }
         }
     }
@@ -268,13 +322,23 @@ fn lib_name(v: &BTreeMap<String, toml::Value>) -> String {
 
 fn bins(v: &mut BTreeMap<String, toml::Value>) -> Vec<Bin> {
     if let Some(toml::Value::Array(bins)) = v.remove("bin") {
-        bins.into_iter().map(|mut x| {
-            let bin = x.as_table_mut().unwrap();
-            Bin {
-                name: if let Some(toml::Value::String(s)) = bin.remove("name") { Some(s) } else { None },
-                path: if let Some(toml::Value::String(s)) = bin.remove("path") { Some(s) } else { None },
-            }
-        }).collect()
+        bins.into_iter()
+            .map(|mut x| {
+                let bin = x.as_table_mut().unwrap();
+                Bin {
+                    name: if let Some(toml::Value::String(s)) = bin.remove("name") {
+                        Some(s)
+                    } else {
+                        None
+                    },
+                    path: if let Some(toml::Value::String(s)) = bin.remove("path") {
+                        Some(s)
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect()
     } else {
         Vec::new()
     }
@@ -307,7 +371,7 @@ fn is_plugin(v: &BTreeMap<String, toml::Value>) -> bool {
 fn build(v: &BTreeMap<String, toml::Value>) -> String {
     if let Some(package) = v.get("package") {
         if let Some(build) = package.as_table().unwrap().get("build") {
-            return build.as_str().unwrap().to_string()
+            return build.as_str().unwrap().to_string();
         }
     }
     String::new()
@@ -320,9 +384,9 @@ fn features(v: &BTreeMap<String, toml::Value>) -> (Vec<String>, BTreeSet<String>
     if let Some(features) = v.get("features") {
         let features = features.as_table().unwrap();
         if let Some(default) = features.get("default") {
-            default_features.extend(
-                default.as_array().unwrap().into_iter().map(|x| x.as_str().unwrap().to_string())
-            )
+            default_features.extend(default.as_array().unwrap().into_iter().map(|x| {
+                x.as_str().unwrap().to_string()
+            }))
         }
         for (f, _) in features.iter() {
             if f != "default" {
